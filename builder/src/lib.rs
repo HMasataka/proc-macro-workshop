@@ -1,67 +1,92 @@
-use proc_macro::TokenStream;
+use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, Data, DeriveInput, Fields, GenericArgument, Ident, PathArguments,
-    PathSegment, Type,
+    parse_macro_input, Data, DeriveInput, Fields, FieldsNamed, GenericArgument, Ident,
+    PathArguments, PathSegment, Type, Visibility,
 };
 
-#[proc_macro_derive(Builder)]
-pub fn derive(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(Builder, attributes(builder))]
+pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
     let ident = input.ident;
     let vis = input.vis;
-
     let builder_name = format_ident!("{}Builder", ident);
 
-    let (idents, types): (Vec<Ident>, Vec<Type>) = match input.data {
+    let fields = match input.data {
         Data::Struct(data) => match data.fields {
-            Fields::Named(fields) => fields
-                .named
-                .into_iter()
-                .map(|field| {
-                    let ident = field.ident;
-                    let ty = field.ty;
-                    (ident.unwrap(), ty)
-                })
-                .unzip(),
-            _ => panic!("no unnamed field are allowed"),
+            Fields::Named(fields) => fields,
+            _ => panic!("no unnamed fields are allowed"),
         },
-        _ => panic!("expects struct"),
+        _ => panic!("this macro can be applied only to structaa"),
     };
 
-    let builder_fields = idents.iter().zip(&types).map(|(ident, ty)| {
-        let t = unwrap_option(ty).unwrap_or(ty);
-        quote! {
-            #ident: Option<#t>
-        }
-    });
+    let builder_struct = build_builder_struct(&fields, &builder_name, &vis);
+    let builder_impl = build_builder_impl(&fields, &builder_name, &ident);
+    let struct_impl = build_struct_impl(&fields, &builder_name, &ident);
 
-    let checks = idents
+    let expand = quote! {
+        #builder_struct
+        #builder_impl
+        #struct_impl
+    };
+    proc_macro::TokenStream::from(expand)
+}
+
+fn build_builder_struct(
+    fields: &FieldsNamed,
+    builder_name: &Ident,
+    visibility: &Visibility,
+) -> TokenStream {
+    let (idents, types): (Vec<&Ident>, Vec<&Type>) = fields
+        .named
         .iter()
-        .zip(&types)
-        .filter(|(_, ty)| !is_option(ty))
-        .map(|(ident, _)| {
-            let err = format!("Required field '{}' is missing", ident.to_string());
+        .map(|field| {
+            let ident = field.ident.as_ref();
+            let ty = unwrap_option(&field.ty).unwrap_or(&field.ty);
+            (ident.unwrap(), ty)
+        })
+        .unzip();
+    quote! {
+        #visibility struct #builder_name {
+            #(#idents: Option<#types>),*
+        }
+    }
+}
+
+fn build_builder_impl(
+    fields: &FieldsNamed,
+    builder_name: &Ident,
+    struct_name: &Ident,
+) -> TokenStream {
+    let checks = fields
+        .named
+        .iter()
+        .filter(|field| !is_option(&field.ty))
+        .map(|field| {
+            let ident = field.ident.as_ref();
+            let err = format!("Required field '{}' is missing", ident.unwrap().to_string());
             quote! {
                 if self.#ident.is_none() {
-                    return Err(#err.into())
+                    return Err(#err.into());
                 }
             }
         });
 
-    let setters = idents.iter().zip(&types).map(|(ident, ty)| {
-        let t = unwrap_option(ty).unwrap_or(ty);
+    let setters = fields.named.iter().map(|field| {
+        let ident = &field.ident;
+        let ty = unwrap_option(&field.ty).unwrap_or(&field.ty);
         quote! {
-            pub fn #ident(&mut self, #ident: #t) -> &mut Self {
+            pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
                 self.#ident = Some(#ident);
                 self
             }
         }
     });
 
-    let struct_fields = idents.iter().zip(&types).map(|(ident, ty)| {
-        if is_option(ty) {
+    let struct_fields = fields.named.iter().map(|field| {
+        let ident = field.ident.as_ref();
+        if is_option(&field.ty) {
             quote! {
                 #ident: self.#ident.clone()
             }
@@ -72,38 +97,39 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     });
 
-    let expand = quote! {
-        #vis struct #builder_name {
-           #(#builder_fields),*
-        }
-
+    quote! {
         impl #builder_name {
             #(#setters)*
 
-            pub fn build(&mut self) -> Result<#ident, Box<dyn std::error::Error>> {
+            pub fn build(&mut self) -> Result<#struct_name, Box<dyn std::error::Error>> {
                 #(#checks)*
-                Ok(#ident {
+                Ok(#struct_name {
                     #(#struct_fields),*
                 })
             }
         }
+    }
+}
 
-        impl #ident {
+fn build_struct_impl(
+    fields: &FieldsNamed,
+    builder_name: &Ident,
+    struct_name: &Ident,
+) -> TokenStream {
+    let field_defaults = fields.named.iter().map(|field| {
+        let ident = field.ident.as_ref();
+        quote! {
+            #ident: None
+        }
+    });
+    quote! {
+        impl #struct_name {
             pub fn builder() -> #builder_name {
                 #builder_name {
-                    #(#idents: None),*
+                    #(#field_defaults),*
                 }
             }
         }
-    };
-
-    proc_macro::TokenStream::from(expand)
-}
-
-fn get_last_path_segment(ty: &Type) -> Option<&PathSegment> {
-    match ty {
-        Type::Path(path) => path.path.segments.last(),
-        _ => None,
     }
 }
 
@@ -129,5 +155,12 @@ fn unwrap_option(ty: &Type) -> Option<&Type> {
             _ => None,
         },
         None => None,
+    }
+}
+
+fn get_last_path_segment(ty: &Type) -> Option<&PathSegment> {
+    match ty {
+        Type::Path(path) => path.path.segments.last(),
+        _ => None,
     }
 }
